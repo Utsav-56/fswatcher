@@ -1,4 +1,4 @@
-module github.com/Utsav-56/fs_watcher
+module github.com/Utsav-56/fswatcher
 
 go 1.25.6
 
