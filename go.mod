@@ -1,0 +1,8 @@
+module github.com/Utsav-56/fs_watcher
+
+go 1.25.6
+
+require (
+	github.com/fsnotify/fsnotify v1.9.0 // indirect
+	golang.org/x/sys v0.13.0 // indirect
+)
