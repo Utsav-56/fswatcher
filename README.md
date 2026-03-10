@@ -32,7 +32,7 @@ go get github.com/fsnotify/fsnotify
 Add to your project:
 
 ```go
-import "github.com/yourproject/folder_watcher"
+import "github.com/utsav-56/fswatcher"
 ```
 
 ## Quick Start
