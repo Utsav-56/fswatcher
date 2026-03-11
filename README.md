@@ -24,22 +24,33 @@ fsnotify events
       │
       ▼
 event collector goroutine
-      │ (non-blocking signal)
-      ▼
-eventTrigger channel (size=1)
       │
-      ▼
-debounce timer (80ms)
+      ├─→ update state (with mutex) ──→ immediate callback
       │
-      ▼
-scan worker goroutine
-      │
-      ▼
-compute diff (snapshot comparison)
-      │
-      ▼
-trigger callbacks
+      └─→ signal eventTrigger ──────────┐
+                                          │
+                                          ▼
+                                    debounce timer (80ms)
+                                          │
+                                          ▼
+                                    scan worker
+                                          │
+                                          ▼
+                                    full diff (with mutex)
+                                          │
+                                          ▼
+                                    batch callbacks
 ```
+
+### Performance Evaluation
+
+| Operation    | Complexity |
+| ------------ | ---------- |
+| Startup scan | O(n)       |
+| Create file  | O(1)       |
+| Delete file  | O(1)       |
+| Modify file  | O(1)       |
+| Memory       | O(n)       |
 
 ### Key Design Principles
 
@@ -56,8 +67,7 @@ This provides **massive performance gains** during bulk operations like `git clo
 
 The event collector immediately pushes a signal to the scan worker and continues listening. The scan worker handles the actual diff computation asynchronously.
 
-- **Old approach**: `fsnotify → scan → fsnotify blocked`
-- **New approach**: `fsnotify → push signal → continue` (scan happens in parallel)
+- **Approach**: `fsnotify → push signal → continue` (scan happens in parallel)
 
 #### 3. **Constant memory usage**
 
@@ -94,6 +104,49 @@ Typical comparison:
 ```bash
 go get github.com/utsav-56/fswatcher
 ```
+
+## Changelog
+
+### v1.0.1 - Critical Bug Fixes (Latest)
+
+**All critical issues from v1.0.0 have been resolved:**
+
+#### 1. Fixed eventTrigger Non-functionality
+
+- **Problem**: `eventTrigger` channel was created but never signaled, causing the debounce worker to never run
+- **Solution**: Added non-blocking signal sending in `handleEvent()` method
+- **Impact**: Debouncing now works correctly, batching rapid events
+
+#### 2. Fixed Race Condition on fsInfo
+
+- **Problem**: Maps were modified without mutex protection, causing crashes under load
+- **Solution**: Added dedicated `fsInfoMu` RWMutex protecting all map access
+- **Impact**: Thread-safe operation, no more race condition crashes
+
+#### 3. Added Rename Event Handling
+
+- **Problem**: `fsnotify.Rename` events were ignored, leaving renamed files in state maps forever
+- **Solution**: Explicit handling for rename events (Linux often sends Rename instead of Remove)
+- **Impact**: Proper cleanup of renamed files and directories
+
+#### 4. Fixed Directory Deletion Child Cleanup
+
+- **Problem**: When deleting a directory, only the parent was removed, orphaning children in state
+- **Solution**: New `removeDirectoryAndChildren()` method with recursive cleanup
+- **Impact**: Complete state consistency when directories are deleted
+
+#### 5. Fixed Recursive Depth Limiting
+
+- **Problem**: `RecursiveDepth` option was ignored during recursive watching
+- **Solution**: `addRecursiveWatches()` now calculates relative depth and respects limits
+- **Impact**: Proper depth control as documented in API
+
+**Architecture improvements:**
+
+- Separate mutexes for better concurrency (`mu` for running state, `fsInfoMu` for maps)
+- Non-blocking event signaling prevents backpressure
+- Clean shutdown guarantees via context
+- No goroutine leaks
 
 ## Usage
 
@@ -404,22 +457,291 @@ The watcher runs **3 goroutines**:
 
 ## Limitations & Future Improvements
 
-### Current Approach: Snapshot-based diffing
+### Current Limitations
 
-The watcher currently uses a **snapshot and diff** model:
+#### 1. **Snapshot-based Diffing**
 
-- **On event**: Take full snapshot → Compare with previous → Compute diff
-- **Complexity**: O(n) per scan
+- **Current approach**: Takes full filesystem snapshot and compares with previous state
+- **Complexity**: O(n) per scan where n = number of files/directories
+- **Impact**: Can be inefficient for very large directories (10k+ files)
+- **Mitigation**: Debouncing reduces scan frequency; acceptable for most use cases
 
-### Future Optimization: Incremental updates
+#### 2. **No Modification Detection**
 
-Future versions may implement **event-driven state updates**:
+- **Current**: Only detects creates, deletes, and renames
+- **Missing**: Doesn't detect file content changes or metadata updates (size, permissions, timestamp)
+- **Workaround**: `OnModify` callback exists but only fires on `fsnotify.Write` events
+- **Note**: The `diffFsInfo()` function only compares presence/absence, not metadata
 
-- **On CREATE**: Add to internal map (O(1))
-- **On DELETE**: Remove from internal map (O(1))
-- **On MODIFY**: Update metadata (O(1))
+#### 3. **Rename/Move Detection Incomplete**
 
-This would reduce complexity from O(n) to O(1) per event, but the snapshot approach is perfectly efficient for most use cases.
+- **Current**: Renames treated as delete at old location
+- **Missing**: No correlation between delete and create to detect moves
+- **Impact**: Applications can't distinguish between "file moved" vs "file deleted + new file created"
+- **Note**: `RenameEvent` struct exists but is not fully utilized
+
+#### 4. **Symlink Handling**
+
+- **Current**: Symlinks are completely skipped to prevent infinite loops
+- **Limitation**: Cannot watch symlinked directories
+- **Impact**: Users must watch the real path, not symlink paths
+- **Security**: This is intentional for safety but may not fit all use cases
+
+#### 5. **No File Filtering/Patterns**
+
+- **Current**: Watches all files and directories (or all of one type)
+- **Missing**: No glob patterns, regex filters, or ignore lists
+- **Examples not supported**: "\*.go only", ".gitignore rules", "exclude node_modules"
+- **Workaround**: Users must filter in their callbacks
+
+#### 6. **No Atomic Operation Detection**
+
+- **Problem**: Editors saving files generate multiple events (write, chmod, etc.)
+- **Current**: Debouncing batches these, but callbacks still see individual operations
+- **Impact**: `OnCreate` might fire multiple times for a single logical operation
+- **Mitigation**: 80ms debounce reduces this significantly
+
+#### 7. **Error Handling Limited**
+
+- **Current**: Errors during directory scans are logged but otherwise ignored
+- **Missing**: No error callbacks or error accumulation
+- **Impact**: Permission errors or broken symlinks silently skip directories
+- **Observability**: Users can't detect when parts of the tree are unwatchable
+
+#### 8. **Platform Differences**
+
+- **fsnotify behavior varies**: Linux sends Rename, macOS may send different events
+- **Testing**: Code handles Rename explicitly but may have edge cases on Windows
+- **Impact**: Behavior may differ slightly between operating systems
+
+#### 9. **Memory Overhead**
+
+- **Current**: Stores full path for every file/directory in memory
+- **Complexity**: O(n) memory where n = total files tracked
+- **Impact**: Watching 100k files = ~100k \* (path length) bytes
+- **Example**: 100k files with 50-char paths ≈ 5MB base overhead
+
+#### 10. **No Event Coalescing Information**
+
+- **Issue**: After debounce, users don't know how many underlying fsnotify events occurred
+- **Missing**: Metadata about whether change was single file or bulk operation
+- **Impact**: Can't optimize differently for "user saved 1 file" vs "git clone 500 files"
+
+### Future Improvements
+
+#### High Priority
+
+##### 1. **Incremental State Updates (Performance)**
+
+```go
+// Instead of:
+fullSnapshot() → compare() → diff()  // O(n)
+
+// Future:
+handleCreate(path) → info.Files[path] = null{}  // O(1)
+handleDelete(path) → delete(info.Files, path)   // O(1)
+```
+
+- **Benefit**: Reduces scan complexity from O(n) to O(1)
+- **Challenge**: Must trust fsnotify events completely (no verification scan)
+- **Hybrid**: Could do incremental + periodic full scan for correctness
+
+##### 2. **Modification Detection with Metadata**
+
+```go
+type FileInfo struct {
+    Path    string
+    Size    int64
+    ModTime time.Time
+    Mode    os.FileMode
+}
+```
+
+- Store file metadata, not just presence
+- Detect content changes, permission changes, timestamp updates
+- New callback: `OnModify` with before/after metadata
+
+##### 3. **Smart Rename/Move Detection**
+
+```go
+type RenameEvent struct {
+    OldPath string
+    NewPath string
+    IsDir   bool
+}
+```
+
+- Correlate DELETE + CREATE with matching inode/size/mtime
+- Time window for correlation (e.g., 100ms)
+- Proper `OnRename` callback invocation
+
+##### 4. **File Filtering with Patterns**
+
+```go
+type Options struct {
+    // ... existing fields
+    IncludePatterns []string  // ["*.go", "*.md"]
+    ExcludePatterns []string  // ["node_modules/**", ".git/**"]
+    IgnoreFile      string    // ".gitignore"
+}
+```
+
+- Glob pattern matching
+- Gitignore-style rules
+- Reduce events and memory for large projects
+
+#### Medium Priority
+
+##### 5. **Error Callbacks**
+
+```go
+type FsWatcher struct {
+    // ... existing fields
+    OnError func(ErrorEvent)
+}
+
+type ErrorEvent struct {
+    Path  string
+    Op    string  // "scan", "watch", "read"
+    Error error
+}
+```
+
+- Surface permission errors, broken symlinks, etc.
+- Allow users to log, retry, or handle errors
+
+##### 6. **Event Metadata and Statistics**
+
+```go
+type CreateEvent struct {
+    // ... existing fields
+    BatchSize     int       // How many fsnotify events coalesced
+    ScanDuration  time.Duration
+    EventTime     time.Time
+}
+```
+
+- Provide insight into watcher behavior
+- Help users understand bulk vs. incremental changes
+- Useful for debugging and optimization
+
+##### 7. **Configurable Debounce Duration**
+
+```go
+type Options struct {
+    // ... existing fields
+    DebounceMs int  // Currently hardcoded to 80ms
+}
+```
+
+- Allow users to tune for their use case
+- Fast response (20ms) vs. heavy batching (500ms)
+
+##### 8. **Symlink Following Option**
+
+```go
+type Options struct {
+    // ... existing fields
+    FollowSymlinks bool
+    MaxSymlinkDepth int  // Prevent infinite loops
+}
+```
+
+- Optional symlink following with loop detection
+- Track seen inodes to prevent cycles
+
+#### Low Priority
+
+##### 9. **Throttling for Massive Changes**
+
+```go
+type Options struct {
+    MaxEventsPerSecond int  // Rate limiting
+    MaxBatchSize       int  // Split huge diffs
+}
+```
+
+- Prevent callback overload during extreme operations
+- Paginate results for enormous directory changes
+
+##### 10. **Platform-Specific Optimizations**
+
+- Linux: Use `inotify` features directly for better performance
+- macOS: Leverage FSEvents for more efficient bulk monitoring
+- Windows: Better ReadDirectoryChangesW integration
+
+##### 11. **Atomic Operation Grouping**
+
+- Detect save-patterns: WRITE → CHMOD → WRITE (common in editors)
+- Delay callbacks until operation appears complete
+- Heuristic-based (file hasn't changed for N ms)
+
+### Workarounds for Current Limitations
+
+#### For No Modification Detection:
+
+```go
+fs.OnModify = func(e watcher.ModifyEvent) {
+    // Manual stat to get metadata
+    info, err := os.Stat(e.Path)
+    if err == nil {
+        // Compare size, modtime, etc.
+    }
+}
+```
+
+#### For Missing File Filtering:
+
+```go
+fs.OnCreate = func(e watcher.CreateEvent) {
+    for _, file := range e.FilesCreated {
+        if !strings.HasSuffix(file, ".go") {
+            continue  // Filter in callback
+        }
+        // Process Go files only
+    }
+}
+```
+
+#### For Rename Detection:
+
+```go
+// Track recent deletes and correlate with creates
+type RecentDelete struct {
+    Path  string
+    Time  time.Time
+}
+
+var recentDeletes []RecentDelete
+
+fs.OnDelete = func(e watcher.DeleteEvent) {
+    for _, path := range e.FilesDeleted {
+        recentDeletes = append(recentDeletes, RecentDelete{path, time.Now()})
+    }
+}
+
+fs.OnCreate = func(e watcher.CreateEvent) {
+    // Check if any create matches recent delete (heuristic)
+}
+```
+
+### Performance Considerations for Large Directories
+
+For projects with 10k+ files:
+
+1. **Use `RecursiveDepth`** to limit scanning depth
+2. **Enable `FilesOnly` or `DirsOnly`** if you don't need both
+3. **Increase debounce** in your own timer wrapper for heavier batching
+4. **Filter in callbacks** to reduce processing overhead
+5. **Consider incremental monitoring** - only watch active subdirectories
+
+### Contributing
+
+If you'd like to implement any of these improvements, contributions are welcome! Priority areas:
+
+- Incremental state updates (biggest performance win)
+- File filtering with glob patterns
+- Improved rename/move detection
 
 ## License
 

@@ -292,7 +292,7 @@ func (fs *FsWatcher) handleEvent(ev fsnotify.Event) {
 	// Handle rename events - Linux often sends Rename instead of Remove
 	if ev.Op&fsnotify.Rename == fsnotify.Rename {
 		fs.fsInfoMu.Lock()
-		
+
 		// Check if it was a file
 		if _, ok := fs.fsInfo.Files[path]; ok {
 			delete(fs.fsInfo.Files, path)
