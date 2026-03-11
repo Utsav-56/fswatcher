@@ -22,6 +22,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -96,8 +97,12 @@ type FsWatcher struct {
 
 	// running tracks whether the watcher is currently active.
 	running bool
-	// mu protects concurrent access to the running field.
+	// mu protects concurrent access to the running field and fsInfo maps.
+	// The mutex ensures thread-safe access when modifying filesystem state.
 	mu sync.Mutex
+	// fsInfoMu specifically protects the fsInfo maps from concurrent access.
+	// This separate mutex prevents race conditions when updating state from events.
+	fsInfoMu sync.RWMutex
 
 	// watcher is the underlying fsnotify watcher instance.
 	watcher *fsnotify.Watcher
@@ -173,6 +178,11 @@ func (fs *FsWatcher) StartWithContext(ctx context.Context) error {
 	return nil
 }
 
+// InitialScan performs an initial scan of the watched directory and updates the internal filesystem snapshot.
+func (fs *FsWatcher) InitialScan() {
+	scanDir(fs.Path, fs.Options.Recursive, fs.Options.RecursiveDepth, &fs.fsInfo)
+}
+
 // eventLoop runs in a separate goroutine and collects filesystem events from fsnotify.
 // It never blocks on scanning - instead, it immediately signals the scan worker and
 // continues listening for more events.
@@ -204,24 +214,151 @@ func (fs *FsWatcher) eventLoop(ctx context.Context) {
 			if !ok {
 				return
 			}
-
-			// if new directory created → watch it
-			if fs.Options.Recursive && ev.Op&fsnotify.Create == fsnotify.Create {
-
-				info, err := os.Stat(ev.Name)
-				if err == nil && info.IsDir() {
-					fs.addRecursiveWatches(ev.Name)
-				}
-			}
-
-			// trigger scan (non blocking)
-			select {
-			case fs.eventTrigger <- struct{}{}:
-			default:
-			}
+			fs.handleEvent(ev)
 
 		case <-fs.watcher.Errors:
 			// ignore errors for now
+		}
+	}
+}
+
+func (fs *FsWatcher) handleEvent(ev fsnotify.Event) {
+
+	path := ev.Name
+
+	if ev.Op&fsnotify.Create == fsnotify.Create {
+
+		fi, err := os.Stat(path)
+		if err != nil {
+			return
+		}
+
+		if fi.IsDir() {
+			fs.fsInfoMu.Lock()
+			fs.fsInfo.Dirs[path] = null{}
+			fs.fsInfoMu.Unlock()
+
+			if fs.Options.Recursive {
+				fs.addRecursiveWatches(path)
+			}
+
+			if fs.OnCreate != nil {
+				fs.OnCreate(CreateEvent{
+					DirsCreated: []string{path},
+				})
+			}
+
+		} else {
+
+			fs.fsInfoMu.Lock()
+			fs.fsInfo.Files[path] = null{}
+			fs.fsInfoMu.Unlock()
+
+			if fs.OnCreate != nil {
+				fs.OnCreate(CreateEvent{
+					FilesCreated: []string{path},
+				})
+			}
+		}
+	}
+
+	if ev.Op&fsnotify.Remove == fsnotify.Remove {
+
+		fs.fsInfoMu.Lock()
+		if _, ok := fs.fsInfo.Files[path]; ok {
+			delete(fs.fsInfo.Files, path)
+			fs.fsInfoMu.Unlock()
+
+			if fs.OnDelete != nil {
+				fs.OnDelete(DeleteEvent{
+					FilesDeleted: []string{path},
+				})
+			}
+		} else if _, ok := fs.fsInfo.Dirs[path]; ok {
+			// Directory deleted - remove it and all children recursively
+			fs.removeDirectoryAndChildren(path)
+			fs.fsInfoMu.Unlock()
+
+			if fs.OnDelete != nil {
+				fs.OnDelete(DeleteEvent{
+					DirsDeleted: []string{path},
+				})
+			}
+		} else {
+			fs.fsInfoMu.Unlock()
+		}
+	}
+
+	// Handle rename events - Linux often sends Rename instead of Remove
+	if ev.Op&fsnotify.Rename == fsnotify.Rename {
+		fs.fsInfoMu.Lock()
+		
+		// Check if it was a file
+		if _, ok := fs.fsInfo.Files[path]; ok {
+			delete(fs.fsInfo.Files, path)
+			fs.fsInfoMu.Unlock()
+
+			if fs.OnDelete != nil {
+				fs.OnDelete(DeleteEvent{
+					FilesDeleted: []string{path},
+				})
+			}
+		} else if _, ok := fs.fsInfo.Dirs[path]; ok {
+			// Directory renamed - remove it and all children recursively
+			fs.removeDirectoryAndChildren(path)
+			fs.fsInfoMu.Unlock()
+
+			if fs.OnDelete != nil {
+				fs.OnDelete(DeleteEvent{
+					DirsDeleted: []string{path},
+				})
+			}
+		} else {
+			fs.fsInfoMu.Unlock()
+		}
+	}
+
+	if ev.Op&fsnotify.Write == fsnotify.Write {
+
+		if fs.OnModify != nil {
+			fs.OnModify(ModifyEvent{
+				Event: Event{
+					Type: Modify,
+					Path: path,
+				},
+			})
+		}
+	}
+
+	// Send non-blocking signal to debounce worker
+	select {
+	case fs.eventTrigger <- struct{}{}:
+	default:
+		// Channel full, signal already pending
+	}
+}
+
+// removeDirectoryAndChildren removes a directory and all its children from the fsInfo maps.
+// This is called when a directory is deleted or renamed to prevent orphaned entries.
+// The fsInfoMu lock must be held by the caller.
+//
+// Parameters:
+//   - dirPath: The directory path to remove along with all its children
+func (fs *FsWatcher) removeDirectoryAndChildren(dirPath string) {
+	// Remove the directory itself
+	delete(fs.fsInfo.Dirs, dirPath)
+
+	// Remove all files and subdirectories that start with this path
+	prefix := dirPath + string(filepath.Separator)
+	for path := range fs.fsInfo.Files {
+		if strings.HasPrefix(path, prefix) {
+			delete(fs.fsInfo.Files, path)
+		}
+	}
+
+	for path := range fs.fsInfo.Dirs {
+		if strings.HasPrefix(path, prefix) {
+			delete(fs.fsInfo.Dirs, path)
 		}
 	}
 }
@@ -287,9 +424,11 @@ func (fs *FsWatcher) scanAndEmit() {
 		newFs = readDir(fs.Path)
 	}
 
+	// Protect fsInfo access with mutex
+	fs.fsInfoMu.Lock()
 	diff := diffFsInfo(fs.fsInfo, newFs)
-
 	fs.fsInfo = newFs
+	fs.fsInfoMu.Unlock()
 
 	if fs.Options.DirsOnly {
 		diff.addedFiles = nil
@@ -332,12 +471,13 @@ func (fs *FsWatcher) scanAndEmit() {
 }
 
 // addRecursiveWatches adds the specified directory and all its subdirectories
-// to the fsnotify watcher. This is called during initialization for recursive mode
-// and whenever a new directory is created in a watched location.
+// to the fsnotify watcher up to the configured RecursiveDepth.
+// This is called during initialization for recursive mode and whenever a new
+// directory is created in a watched location.
 //
-// The method walks the entire directory tree and adds each directory to fsnotify.
-// Files are not added individually - fsnotify watches directories and reports events
-// for all files within them.
+// The method walks the directory tree respecting the depth limit and adds each
+// directory to fsnotify. Files are not added individually - fsnotify watches
+// directories and reports events for all files within them.
 //
 // Errors during walking (permission denied, broken symlinks, etc.) are silently
 // ignored to prevent a single inaccessible directory from stopping the watcher.
@@ -345,15 +485,35 @@ func (fs *FsWatcher) scanAndEmit() {
 // Parameters:
 //   - root: The root directory path to start the recursive watch from
 func (fs *FsWatcher) addRecursiveWatches(root string) {
+	maxDepth := fs.Options.RecursiveDepth
+	if maxDepth == -1 {
+		maxDepth = 10000 // effectively infinite
+	}
 
 	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 
 		if err != nil {
-			return nil
+			return nil // ignore errors
 		}
 
 		if d.IsDir() {
-			fs.watcher.Add(path)
+			// Calculate current depth relative to root
+			relPath, _ := filepath.Rel(root, path)
+			currentDepth := 0
+			if relPath != "." {
+				currentDepth = len(filepath.SplitList(relPath))
+				if currentDepth == 0 && relPath != "" {
+					// filepath.SplitList may return empty for single dirs
+					currentDepth = 1
+				}
+			}
+
+			if currentDepth <= maxDepth {
+				fs.watcher.Add(path)
+			} else {
+				// Stop descending into this directory
+				return filepath.SkipDir
+			}
 		}
 
 		return nil

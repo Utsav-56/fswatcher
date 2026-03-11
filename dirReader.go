@@ -9,6 +9,12 @@ import (
 	"path/filepath"
 )
 
+// null is an empty struct used as a placeholder value in maps to represent the presence of a key.
+// Using struct{} as a value type is a common Go idiom for sets, as it occupies zero bytes of storage.
+//
+// this is performant for our use case because we only care about the presence of a path in the map, not any associated metadata.
+type null struct{}
+
 // FsInfo represents a snapshot of the filesystem state at a specific point in time.
 // It stores directory and file information in separate maps for efficient lookups
 // and comparison.
@@ -20,9 +26,9 @@ import (
 // determine exactly what changed.
 type FsInfo struct {
 	// Dirs maps directory paths to their file information metadata.
-	Dirs map[string]os.FileInfo
+	Dirs map[string]null
 	// Files maps file paths to their file information metadata.
-	Files map[string]os.FileInfo
+	Files map[string]null
 }
 
 // pathDiff represents the differences between two filesystem snapshots.
@@ -52,8 +58,8 @@ type pathDiff struct {
 //   - FsInfo: A new filesystem snapshot structure with empty but pre-allocated maps
 func newFsInfo() FsInfo {
 	return FsInfo{
-		Dirs:  make(map[string]os.FileInfo, 128),
-		Files: make(map[string]os.FileInfo, 256),
+		Dirs:  make(map[string]null, 128),
+		Files: make(map[string]null, 256),
 	}
 }
 
@@ -131,13 +137,7 @@ func scanDir(path string, recursive bool, depth int, info *FsInfo) {
 		fullPath := filepath.Join(path, e.Name())
 
 		if e.IsDir() {
-
-			fi, err := e.Info()
-			if err != nil {
-				continue
-			}
-
-			info.Dirs[fullPath] = fi
+			info.Dirs[fullPath] = null{}
 
 			if recursive {
 
@@ -150,13 +150,7 @@ func scanDir(path string, recursive bool, depth int, info *FsInfo) {
 			}
 
 		} else {
-
-			fi, err := e.Info()
-			if err != nil {
-				continue
-			}
-
-			info.Files[fullPath] = fi
+			info.Files[fullPath] = null{}
 		}
 	}
 }
